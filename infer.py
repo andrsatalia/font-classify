@@ -20,13 +20,13 @@ def parse_args():
     parser.add_argument(
         "--model_folder",
         type=str,
-        default="sample_data/model",
+        default="model_output6",
         help="Path where the trained model was saved",
     )
     parser.add_argument(
         "--data_folder",
         type=Path,
-        default="sample_data/output/Lato-Regular",
+        default="output6",
         help="Path to images to run inference on",
     )
     parser.add_argument(

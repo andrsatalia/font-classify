@@ -18,7 +18,7 @@ import sys
 import random
 import traceback
 import wikipedia
-
+import easyocr
 from PIL import Image, ImageDraw, ImageFont
 from argparse import ArgumentParser
 from loguru import logger
@@ -27,7 +27,7 @@ from sklearn.cluster import KMeans
 from tqdm import tqdm
 from typing import Tuple, Optional
 
-
+Image.MAX_IMAGE_PIXELS = None
 logger.remove()
 logger.add(sys.stdout, level="INFO")
 
@@ -80,6 +80,80 @@ def get_common_colors(
         else:
             raise Exception("Unknown select_color")
     return [c.astype(np.uint8) for c in colors]
+
+
+def get_text_thresholded_images(image: Image, bbox: tuple, box_present: bool = True):
+    """
+    Processes an image to extract thresholded text regions using provided bounding boxes.
+
+    Args:
+        image: A PIL Image instance.
+        bounding_boxes: A list of bounding boxes, where each box is a tuple of four points (tl, tr, br, bl).
+
+    Returns:
+        A binary mask of input image in PIL format.
+    """
+    if image is None or not bbox:
+        return None
+    cropped_img_ = image.crop(bbox) if box_present else image
+    # Convert PIL Image to numpy array
+    cropped_img = np.array(cropped_img_)
+    # Convert to grayscale
+    gray = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY)
+    # Otsu's thresholding
+    ret, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thresh_inv = cv2.bitwise_not(thresh)
+    stacked = np.dstack((thresh_inv, thresh_inv, thresh_inv))
+    img_th = cv2.bitwise_and(cropped_img, stacked)
+    img_th[img_th > 0] = 255
+    img_th = Image.fromarray(img_th).convert("L")
+    # img_th.save('data/modified_text_mask.png')
+    return cropped_img_, img_th
+
+
+def convert_points_to_bounding_box(points):
+    """
+    Convert bounding box points to [x, y, width, height] format.
+
+    :param points: List of tuples representing the four points [(x1, y1), (x2, y2), (x3, y3), (x4, y4)].
+    :return: Tuple representing the bounding box in [x, y, width, height] format.
+    """
+    # Unpack points
+    x1, y1 = points[0]
+    x2, y2 = points[1]
+    x3, y3 = points[2]
+    x4, y4 = points[3]
+
+    # Calculate min and max for x and y
+    x_min = min(x1, x2, x3, x4)
+    y_min = min(y1, y2, y3, y4)
+    x_max = max(x1, x2, x3, x4)
+    y_max = max(y1, y2, y3, y4)
+
+    # Calculate width and height
+    width = x_max - x_min
+    height = y_max - y_min
+
+    return (x_min, y_min, width, height)
+
+
+def convert_bbox_to_edges(bbox):
+    """
+    Convert a bounding box from [x, y, width, height] format to [left, upper, right, lower] format.
+
+    :param bbox: Tuple representing the bounding box in [x, y, width, height] format.
+    :return: Tuple representing the bounding box in [left, upper, right, lower] format.
+    """
+    # Unpack bounding box
+    x, y, width, height = bbox
+
+    # Calculate edges
+    left = x
+    upper = y
+    right = x + width
+    lower = y + height
+
+    return (left, upper, right, lower)
 
 
 def load_image(image_path):
@@ -350,7 +424,7 @@ class FontGenerator:
     def load_fonts(self, path: str):
         for root, dirs, files in os.walk(path):
             for file in files:
-                if file.endswith(".ttf"):
+                if file.endswith(".ttf") or file.endswith(".otf"):
                     if file in self.blacklisted_fonts:
                         continue
                     fontname = os.path.splitext(file)[0]
@@ -384,7 +458,7 @@ class FontGenerator:
         logger.debug(f"Generating image with text: {text}")
         # Generate image
         if background_image:
-            image = self.get_random_background()
+            image = self.get_random_background()#.resize(self.size)
             logger.debug(f"Background image with size: {image.size}")
             colors = get_common_colors(np.array(image), colors=12, max_points=1e5, N=1)
             logger.debug(f"Common colors: {colors}")
@@ -493,9 +567,9 @@ class FontGenerator:
             background = Image.open(random_background)
             background = background.convert("RGB")
             self.backgrounds_cache[random_background] = background
-
+        # background = background.resize(self.size)
         # Random crop with padding
-        background = self.random_crop_with_padding(background, pad_color)
+        # background = self.random_crop_with_padding(background, pad_color)
 
         # Apply color
         if self.gray_color:
@@ -528,19 +602,19 @@ def parse_args():
         "--max_fonts", type=int, default=3000, help="Maximum number of fonts to use"
     )
     parser.add_argument(
-        "--output", type=str, default="sample_data/output", help="Output folder"
+        "--output", type=str, default="output", help="Output folder"
     )
     parser.add_argument(
         "--backgrounds",
         type=str,
-        default="sample_data/backgrounds/",
+        default="backgrounds/",
         help="Path for background images, supports JPG, PNG",
     )
     parser.add_argument(
         "--fonts",
         type=str,
-        default="sample_data/fonts/",
-        help="Path to folder with fonts in TTF format",
+        default="training_fonts",
+        help="Path to folder with fonts in TTF or OTF format",
     )
     parser.add_argument(
         "--font_size_min", type=int, default=16, help="Minimum font size"
@@ -588,7 +662,7 @@ def main(args):
 
     # Init font generator
     font_generator = FontGenerator(
-        size=(256, 256),
+        size=(2048, 2048),
         min_length=args.min_length,
         max_length=args.max_length,
         backgrounds_path=args.backgrounds,
@@ -597,6 +671,9 @@ def main(args):
         source=args.text_source,
         textfile=args.textfile,
     )
+
+    ocr_reader = easyocr.Reader(['en']) # this needs to run only once to load the model into memory
+
 
     font_names = list(font_generator.fonts.keys())
     for font_name in tqdm(font_names):
@@ -616,7 +693,10 @@ def main(args):
                     background_color = None
                 else:
                     background_image = False
-                    background_color = tuple(np.random.randint(0, 256, 3))
+                    # background_color = tuple(np.random.randint(0, 256, 3))
+                    # only black and white backgrounds
+                    background_color = (255, 255, 255) if np.random.rand() > 0.5 else (0, 0, 0)
+                    font_color = (0, 0, 0) if background_color == (255, 255, 255) else (255, 255, 255)
 
                 # Generate image
                 image, font_name, font_color = font_generator.generate_image(
@@ -630,9 +710,23 @@ def main(args):
                     background_color=background_color,
                 )
 
-                # Save image
                 (Path(args.output) / font_name).mkdir(exist_ok=True)
-                image.save(os.path.join(args.output, font_name, f"{i}.jpg"))
+                # use EasyOCR to crop text region
+                results = ocr_reader.readtext(np.array(image))
+                for j, (bbox, text, confidence) in enumerate(results):
+                    x_min = min(bbox[0][0], bbox[1][0], bbox[2][0], bbox[3][0])
+                    y_min = min(bbox[0][1], bbox[1][1], bbox[2][1], bbox[3][1])
+                    x_max = max(bbox[0][0], bbox[1][0], bbox[2][0], bbox[3][0])
+                    y_max = max(bbox[0][1], bbox[1][1], bbox[2][1], bbox[3][1])
+                    cropped_image = image.crop((x_min, y_min, x_max, y_max))
+                    text_bbox_converted_ = convert_points_to_bounding_box(bbox)
+                    cropped_text, text_mask = get_text_thresholded_images(
+                        cropped_image, convert_bbox_to_edges(text_bbox_converted_)
+                    )
+                    text_mask.save(os.path.join(args.output, font_name, f"{i}_{j + 1}.jpg"))
+
+                # Save image
+                # image.save(os.path.join(args.output, font_name, f"{i}.jpg"))
             except Exception as e:
                 print(f"Error while generating image {i}: {e}")
                 traceback.print_exc()

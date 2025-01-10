@@ -168,3 +168,19 @@ cython_debug/
 
 # MacOS
 .DS_Store
+curated_backgrounds/
+model/
+model_output3/
+model_output4/
+model_output5/
+model_output6/
+output/
+output1/
+output2/
+output3/
+output4/
+output5/
+output6/
+inference_results.json
+runs/
+val2017/

@@ -31,13 +31,13 @@ def parse_args():
     parser.add_argument(
         "--image_folder",
         type=str,
-        default="sample_data/output",
+        default="output6",
         help="Path to the folder containing the images",
     )
     parser.add_argument(
         "--output_folder",
         type=str,
-        default="sample_data/model",
+        default="model_output6",
         help="Path to the folder where the trained model will be saved",
     )
     parser.add_argument(
