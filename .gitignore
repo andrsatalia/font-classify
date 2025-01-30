@@ -184,3 +184,7 @@ output6/
 inference_results.json
 runs/
 val2017/
+*.png
+*.jpg
+*.txt
+*.pth

@@ -19,13 +19,15 @@ import random
 import traceback
 import wikipedia
 import easyocr
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageColor
 from argparse import ArgumentParser
 from loguru import logger
 from pathlib import Path
 from sklearn.cluster import KMeans
 from tqdm import tqdm
 from typing import Tuple, Optional
+from collections import Counter
+
 
 Image.MAX_IMAGE_PIXELS = None
 logger.remove()
@@ -82,7 +84,7 @@ def get_common_colors(
     return [c.astype(np.uint8) for c in colors]
 
 
-def get_text_thresholded_images(image: Image, bbox: tuple, box_present: bool = True):
+def get_text_thresholded_images(image: Image):
     """
     Processes an image to extract thresholded text regions using provided bounding boxes.
 
@@ -93,9 +95,9 @@ def get_text_thresholded_images(image: Image, bbox: tuple, box_present: bool = T
     Returns:
         A binary mask of input image in PIL format.
     """
-    if image is None or not bbox:
+    if image is None:
         return None
-    cropped_img_ = image.crop(bbox) if box_present else image
+    cropped_img_ = image
     # Convert PIL Image to numpy array
     cropped_img = np.array(cropped_img_)
     # Convert to grayscale
@@ -109,6 +111,59 @@ def get_text_thresholded_images(image: Image, bbox: tuple, box_present: bool = T
     img_th = Image.fromarray(img_th).convert("L")
     # img_th.save('data/modified_text_mask.png')
     return cropped_img_, img_th
+
+
+def get_hex_codes(crop, top_k=3):
+    # Create a mask for the crop
+    mask = Image.new("L", crop.size, 255)  # Start with all white (include all pixels)
+    draw = ImageDraw.Draw(mask)
+
+    hex_counter = Counter()
+    total_pixels = 0
+    for y in range(crop.height):
+        for x in range(crop.width):
+            if mask.getpixel((x, y)) == 255:  # Check if pixel is not in any bbox
+                r, g, b = crop.getpixel((x, y))
+                hex_code = f"#{r:02x}{g:02x}{b:02x}"
+                hex_counter[hex_code] += 1
+                total_pixels += 1
+
+    # Get the top-k most common hex codes
+    top_k_hex_codes = hex_counter.most_common(top_k)
+    # Separate lists for hex codes and their percentages
+    hex_codes = [hex_code for hex_code, _ in top_k_hex_codes]
+    percentages = [(count / total_pixels) * 100 for _, count in top_k_hex_codes]
+    return hex_codes, percentages
+
+
+def create_color_mask(image, hex_color, tolerance=10):
+    """
+    Creates a binary mask of an image based on a hex color.
+
+    Args:
+        image (PIL.Image.Image): The input PIL image.
+        hex_color (str): The hex color code (e.g., '#FF0000').
+        tolerance (int): The allowed deviation in RGB values (default: 10).
+
+    Returns:
+        PIL.Image.Image: A binary (grayscale) mask image.
+    """
+    # 1. Convert Hex to RGB
+    target_rgb = ImageColor.getrgb(hex_color)
+    # 2. Convert PIL Image to Numpy Array for efficiency
+    image_array = np.array(image)
+    # 3. Create a mask for each color channel
+    r_mask = np.abs(image_array[:, :, 0] - target_rgb[0]) <= tolerance
+    g_mask = np.abs(image_array[:, :, 1] - target_rgb[1]) <= tolerance
+    b_mask = np.abs(image_array[:, :, 2] - target_rgb[2]) <= tolerance
+    # 4. Combine the color channels to create the final mask
+    mask_array = r_mask & g_mask & b_mask
+    # 5. Convert the boolean mask to an integer mask
+    mask_array = mask_array.astype(np.uint8) * 255
+    # 6. Create and return PIL image from mask
+    mask_image = Image.fromarray(mask_array, mode="L")
+
+    return mask_image
 
 
 def convert_points_to_bounding_box(points):
@@ -590,9 +645,9 @@ def get_n_max_logits(arr: np.array, n: int):
 
 def parse_args():
     parser = ArgumentParser()
-    parser.add_argument("N", type=int, help="Number of generated examples")
+    parser.add_argument("--N", default=4000, type=int, help="Number of generated examples")
     parser.add_argument(
-        "--min_length", type=int, default=5, help="Minimum length of generated text"
+        "--min_length", type=int, default=7, help="Minimum length of generated text"
     )
     parser.add_argument(
         "--max_length", type=int, default=30, help="Maximum length of generated text"
@@ -602,12 +657,12 @@ def parse_args():
         "--max_fonts", type=int, default=3000, help="Maximum number of fonts to use"
     )
     parser.add_argument(
-        "--output", type=str, default="output", help="Output folder"
+        "--output", type=str, default="output9", help="Output folder"
     )
     parser.add_argument(
         "--backgrounds",
         type=str,
-        default="backgrounds/",
+        default="val2017/",
         help="Path for background images, supports JPG, PNG",
     )
     parser.add_argument(
@@ -617,15 +672,15 @@ def parse_args():
         help="Path to folder with fonts in TTF or OTF format",
     )
     parser.add_argument(
-        "--font_size_min", type=int, default=16, help="Minimum font size"
+        "--font_size_min", type=int, default=36, help="Minimum font size"
     )
     parser.add_argument(
-        "--font_size_max", type=int, default=96, help="Maximum font size"
+        "--font_size_max", type=int, default=102, help="Maximum font size"
     )
     parser.add_argument(
         "--background_ratio",
         type=float,
-        default=0.8,
+        default=0.0,
         help="Ratio between results with background image and white color",
     )
     parser.add_argument(
@@ -693,10 +748,11 @@ def main(args):
                     background_color = None
                 else:
                     background_image = False
-                    # background_color = tuple(np.random.randint(0, 256, 3))
-                    # only black and white backgrounds
-                    background_color = (255, 255, 255) if np.random.rand() > 0.5 else (0, 0, 0)
-                    font_color = (0, 0, 0) if background_color == (255, 255, 255) else (255, 255, 255)
+                    background_color = tuple(np.random.randint(0, 256, size=3))
+                    luminance = 0.2126 * background_color[0] + 0.7152 * background_color[1] + 0.0722 * background_color[2]
+                    threshold = 128
+                    font_color = (255, 255, 255) if luminance < threshold else (0, 0, 0)
+                    print(background_color, font_color)
 
                 # Generate image
                 image, font_name, font_color = font_generator.generate_image(
@@ -712,18 +768,25 @@ def main(args):
 
                 (Path(args.output) / font_name).mkdir(exist_ok=True)
                 # use EasyOCR to crop text region
-                results = ocr_reader.readtext(np.array(image))
-                for j, (bbox, text, confidence) in enumerate(results):
+                text_blocks = ocr_reader.readtext(np.array(image), paragraph=True)
+                for j, results in enumerate(text_blocks):
+                    bbox, text = results[0], results[1]
+                    if len(text) < 1:
+                        continue
                     x_min = min(bbox[0][0], bbox[1][0], bbox[2][0], bbox[3][0])
                     y_min = min(bbox[0][1], bbox[1][1], bbox[2][1], bbox[3][1])
                     x_max = max(bbox[0][0], bbox[1][0], bbox[2][0], bbox[3][0])
                     y_max = max(bbox[0][1], bbox[1][1], bbox[2][1], bbox[3][1])
                     cropped_image = image.crop((x_min, y_min, x_max, y_max))
-                    text_bbox_converted_ = convert_points_to_bounding_box(bbox)
+                    hex_codes, percentages = get_hex_codes(cropped_image, top_k=1)
                     cropped_text, text_mask = get_text_thresholded_images(
-                        cropped_image, convert_bbox_to_edges(text_bbox_converted_)
-                    )
-                    text_mask.save(os.path.join(args.output, font_name, f"{i}_{j + 1}.jpg"))
+                        cropped_image)
+                    msked_img = create_color_mask(cropped_image, hex_codes[0])
+                    if np.random.rand() > 0.8:
+                        msked_img = np.array(msked_img, dtype=np.uint8)
+                        msked_img = 255 - msked_img
+                        msked_img = Image.fromarray(msked_img)
+                    msked_img.save(os.path.join(args.output, font_name, f"{i}_{j + 1}.jpg"))
 
                 # Save image
                 # image.save(os.path.join(args.output, font_name, f"{i}.jpg"))

@@ -8,11 +8,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.backends.cudnn as cudnn
-
+from transformers import AutoFeatureExtractor, SwinForImageClassification
 from PIL import Image
 from albumentations.pytorch import ToTensorV2
 from pathlib import Path
 from torch.optim import lr_scheduler
+from transformers import get_linear_schedule_with_warmup
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.datasets import ImageFolder
 from tqdm import tqdm
@@ -31,13 +32,13 @@ def parse_args():
     parser.add_argument(
         "--image_folder",
         type=str,
-        default="output6",
+        default="output9",
         help="Path to the folder containing the images",
     )
     parser.add_argument(
         "--output_folder",
         type=str,
-        default="model_output6",
+        default="model_output9_no_transforms",
         help="Path to the folder where the trained model will be saved",
     )
     parser.add_argument(
@@ -50,15 +51,15 @@ def parse_args():
         "-net",
         "--network_type",
         type=str,
-        default="resnet50",
+        default='resnet50',
         help="Type of network architecture",
-    )
+    )#swin_base_patch4_window12_384 "resnet50"
     parser.add_argument("-bs", "--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument(
         "-lr", "--learning_rate", type=float, default=0.0001, help="Learning rate"
-    )
+    )#5e-5 0.0001
     parser.add_argument(
-        "-e", "--num_epochs", type=int, default=100, help="Number of epochs"
+        "-e", "--num_epochs", type=int, default=200, help="Number of epochs"
     )
     parser.add_argument(
         "--num_workers", type=int, default=4, help="Number of workers for dataloader"
@@ -86,6 +87,19 @@ class CustomImageFolder(ImageFolder):
 
         return sample, target
 
+
+class CustomImageFolderSWIN(ImageFolder):
+
+    def __init__(self, root, transform, **kwargs):
+        super(CustomImageFolderSWIN, self).__init__(root, **kwargs)
+        self.feature_extractor = transform
+
+    def __getitem__(self, index):
+        path, target = self.samples[index]
+        sample = Image.open(path).convert("RGB")
+        inputs = self.feature_extractor(sample)
+        return inputs, target
+    
 
 class ResizeWithPad:
 
@@ -141,22 +155,33 @@ class CutMax:
 
 def main(args):
     os.makedirs(args.output_folder, exist_ok=True)
+    # Define the  model
+    network_type = args.network_type
+    model = timm.create_model(
+        network_type, pretrained=True, num_classes=5
+    )
+    model.to(device)
+    
+    data_config = timm.data.resolve_model_data_config(model)
+    transform_swin = timm.data.create_transform(**data_config, is_training=False)
+    
 
     # Define a custom transform function to preprocess the images using Albumentations
     image_transforms = [
         # A.Lambda(image=CutMax(1024)),
-        A.Lambda(image=ResizeWithPad((320, 320))),  # Custom SquarePad
-        A.ShiftScaleRotate(
-            shift_limit=0.1,
-            scale_limit=(-0.2, 0.2),
-            rotate_limit=15,
-            interpolation=1,
-            p=0.7,
-        ),
-        # A.RandomBrightnessContrast(p=0.2),
-        A.ColorJitter(p=0.2),
-        A.ISONoise(p=0.2),
-        A.ImageCompression(quality_lower=70, quality_upper=95, p=0.2)
+        A.Lambda(image=ResizeWithPad((512, 512))),  # Custom SquarePad
+        A.RandomCrop(320, 320)
+        # A.ShiftScaleRotate(
+        #     shift_limit=0.1,
+        #     scale_limit=(-0.2, 0.2),
+        #     rotate_limit=15,
+        #     interpolation=1,
+        #     p=0.7,
+        # ),
+        # # A.RandomBrightnessContrast(p=0.2),
+        # A.ColorJitter(p=0.2),
+        # A.ISONoise(p=0.2),
+        # A.ImageCompression(quality_lower=70, quality_upper=95, p=0.2)
     ]
 
     transform = A.Compose(
@@ -175,12 +200,11 @@ def main(args):
     # Access the arguments
     image_folder = args.image_folder
     # label_file = args.label_file
-    network_type = args.network_type
     best_model_params_path = os.path.join(args.output_folder, "best_model_params.pt")
 
     # Create an instance of the custom dataset
-    # dataset = CustomDataset(image_folder, label_file, transform=transform)
     dataset = CustomImageFolder(image_folder, transform=transform)
+    # dataset = CustomImageFolderSWIN(image_folder, transform_swin)
     n = len(dataset)  # total number of examples
     n_test = int(args.test_split * n)  # take ~10% for test
     train_dataset, test_dataset = torch.utils.data.random_split(
@@ -214,29 +238,24 @@ def main(args):
     )
     dataloaders = {"train": train_dataloader, "val": test_dataloader}
 
-    # Define the ResNet model
-    model = timm.create_model(
-        network_type, pretrained=True, num_classes=len(class_names)
-    )
-    model.to(device)
-
-    # Define the loss function and optimizer
     # criterion = nn.BCEWithLogitsLoss()
     criterion = nn.CrossEntropyLoss()
+    
     optimizer = optim.AdamW(
         model.parameters(), lr=args.learning_rate, weight_decay=1e-4
     )
-
-    # Decay LR by a factor of 0.1 every 7 epochs
-    # scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.2)
-    # lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.num_epochs, eta_min=0)
-    # scheduler = lr_scheduler.CosineAnnealingWarmRestarts(
-    #     optimizer, T_0=args.num_epochs//4, T_mult=1, eta_min=0
-    # )
-    # scheduler = lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.75, patience=5, verbose=True)
-    # Define OneCycleLR scheduler
     total_steps = len(train_dataloader) * args.num_epochs  # Number of iterations in total
     scheduler = lr_scheduler.OneCycleLR(optimizer, max_lr=args.learning_rate*10, total_steps=total_steps, pct_start=0.1)
+
+    # optimizer = optim.Adam(model.parameters(), lr=args.learning_rate, betas=(0.9, 0.999), eps=1e-8)
+    # num_training_steps = len(train_dataloader) * args.num_epochs // 1
+    # warmup_steps = int(0.1 * num_training_steps)
+    # scheduler = get_linear_schedule_with_warmup(
+    # optimizer,
+    # num_warmup_steps=warmup_steps,
+    # num_training_steps=num_training_steps
+    # )
+
 
     # Create a TensorBoard writer
     writer = SummaryWriter()
@@ -274,7 +293,7 @@ def main(args):
                         outputs = model(inputs)
                         _, preds = torch.max(outputs, 1)
                         loss = criterion(outputs, labels)
-
+                    
                     # backward + optimize only if in training phase
                     if phase == "train":
                         loss.backward()
